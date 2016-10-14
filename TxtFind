@@ -1,0 +1,359 @@
+package org.mflower.bo;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.nio.CharBuffer;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileChannel.MapMode;
+import java.nio.charset.Charset;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Title: 工具集合<br>
+ * Description: 文本内容关键词搜索+分页<br>
+ * Copyright: Copyright (c) 2009<br>
+ * Company: MYOU<br>
+ * 
+ * @author cjy
+ * @version 1.0
+ */
+public class ImHistoryFind {
+
+    /** 方向常量-正向 */
+    public static final Short ASC = 1;
+    /** 方向常量-反向 */
+    public static final Short DESC = 0;
+    /** 内存容量为1M */
+    private static final Integer ENVSIZE = 1048576;
+
+    /* 下列变量需要传入 */
+
+    /** 历史记录文件地址 */
+    private String url;
+    /** 查询关键字，可能没有 */
+    private String keyword;
+    /** 起始位置，如果为-1，则表示第一次进入，只能反向（上一页） */
+    private long posStart = -1;
+    /** 结束位置，如果为-1，则表示第一次进入，只能反向（上一页） */
+    private long posEnd = -1;
+    /** 对方邮件 */
+    private String email;
+    /** 方向，1为正向，0为反向,默认为反向 */
+    private Short aspect = DESC;
+
+    /* 下列变量不需要传入 */
+
+    /** 应该跳过的size */ 
+    private long posSkip = 0;
+    /** 分页List,存放所有记录 */
+    private List<String> list = new ArrayList<String>();
+    /** 如果是关键字搜索，需要存放起始-截止pos，与list同增同减，存的是最后一个\n的索引 */
+    private List<Long> posList = new ArrayList<Long>();
+    /** 异常消息 */
+    private String errorMsg;
+
+    /**
+     * 带参数的构造方法,关键字搜索，特殊处理，需要传回每一项的pos
+     * @param url 文件地址
+     * @param keyword 搜索关键字
+     * @param email 对方email
+     * @param pos 地址
+     * @param aspect 方向
+     */
+    public ImHistoryFind(String url, String keyword, String email, Long posStart, Long posEnd, Short aspect){
+
+        this.url = url;
+        this.keyword = keyword;
+        this.email = email;
+        this.posStart = posStart;
+        this.posEnd = posEnd;
+        this.aspect = aspect;
+    }
+
+    /**
+     * 带参数的构造方法,单纯查询历史记录时并且为第一页时使用
+     * @param url 文件地址
+     * @param keyword 搜索关键字
+     * @param email 对方email
+     * @param pos 地址
+     * @param aspect 方向
+     */
+    public ImHistoryFind(String url, String email){
+
+        this.url = url;
+        this.email = email;
+    }
+
+    public void readFile() throws Exception {
+
+        // 复位
+        posSkip = 0;
+        try {
+            // 输入流
+            FileInputStream fis = new FileInputStream(new File(url));
+            // 文件管道对象
+            FileChannel fci = fis.getChannel();
+            // 内存索引对象
+            MappedByteBuffer bb = null;
+            Charset charset = Charset.forName("gbk");
+
+            // 取行时使用
+            StringBuffer sb = new StringBuffer();
+            // 文件长度
+            long size = fci.size();
+            if (aspect.compareTo(ASC) == 0 && (posEnd == -1 || posEnd >= size)){
+                // 正向，从头到尾读,此种读法不会从末尾位置开始，也就是说posEnd不会为-1
+                errorMsg = "END";
+                return;
+            } else if (aspect.compareTo(DESC) == 0 && posStart == 0){
+                errorMsg = "START";
+                return;
+            }
+            // 循环一次，读取一M
+            fileloop:
+            while (true) {
+             // 判断方向，并处理起始位置,如果为正向（从头到尾读，否则为从尾到头读）
+                if (aspect.compareTo(ASC) == 0){
+                    // 正向，从头到尾读,此种读法不会从末尾位置开始，也就是说posEnd不会为-1
+                    if (posEnd >= size){
+                        break;
+                    }
+                    posStart = posEnd;
+                    long tempStart = posStart == 0 ? 0 : posStart + 1;
+                    posStart = posStart == size ? size : tempStart;
+                    posEnd = posEnd + ENVSIZE;
+                    posEnd = posEnd > size ? size : posEnd;
+                } else {
+                    // 反向，上一页，到头部之后则不能再读取
+                    if (posStart == 0){
+                        break;
+                    }
+                    posEnd = posEnd == -1 ? size : posStart;
+                    // 结束索引需要上移一位，70为上次的开始索引，则上一行的结束索引应该是69,考虑为1的情况不？
+                    posEnd = posEnd == size ? size : posEnd - 1;
+                    posStart = size - ENVSIZE;
+                    
+                    // 从第一页往下，再往前的时候，会出现start>end，导致查不出数据的情况，解决bug
+                    if (posStart >= posEnd){
+                        posStart = posEnd - ENVSIZE;
+                    }
+                    posStart = posStart < 0 ? 0 : posStart;
+                }
+                // 将文件内容映射到内存中，搜索时如果没有大于10条结果可能会出现mapEnd为-1的情况，需要特殊判断处理 改2
+                long mapEnd = posEnd - posStart;
+                if (mapEnd < 0){
+                    // 这种处理方式在大于1M时搜索时会出现丢掉最开始的记录的情况，暂时可以接受。有时间慢慢处理。(因头部的最前一波数据被跳过了)
+                    break;
+                }
+                bb = fci.map(MapMode.READ_ONLY, posStart, mapEnd);
+                CharBuffer chars = charset.decode(bb);
+                bb.flip();
+                bb.clear();
+                // 循环一M内容，分成行，从后往前进行数据拼接？取数也是从最后进行，反序循环
+                if (aspect.compareTo(DESC) == 0){
+                    // 倒序减少posStart，将量提前
+                    for (int i = chars.length() - 1; i >= 0; i--){
+                        char b = chars.get(i);
+                        // 分页，每页10条
+                        if (list.size() >= 10){
+                            // 反序则需要将上一个换行符还回去
+                            posSkip -= 1;
+                            // 如果需要跳出，意味着不需要向下扫描，下一页时接着扫描，所以将pos加回去
+                            posStart += (posEnd -  posSkip);
+                            // 如果起始已经大于结束，表示1M之后，需要特殊处理，用end直接减去skip 改1
+                            if (posStart >= posEnd){
+                                posStart = posEnd -  posSkip;
+                            }
+                            break fileloop;
+                        }
+                        if (b > 0x80){
+                            // 双字节
+                            posSkip += 2;
+                        } else {
+                            posSkip += 1;
+                        }
+                        doFind(sb, list, b);
+                    }
+                } else {
+                    for (int i = 0; i < chars.length(); i++){
+                        char b = chars.get(i);
+                        // 分页，每页10条
+                        if (list.size() >= 10){
+                            // 不再需要向上扫描，将pos减回去
+                            posEnd = posStart + posSkip - 1;
+                            break fileloop;
+                        }
+                        if (b > 0x80){
+                            // 双字节
+                            posSkip += 2;
+                        } else {
+                            posSkip += 1;
+                        }
+                        doFind(sb, list, b);
+                    }
+                }
+                chars.flip();
+                chars.clear();
+                if (sb.length() > 0){
+                    String tempStr = sb.toString();
+                    boolean isSuc = findStr(sb, keyword, email);
+                    if (isSuc){
+                        list.add(tempStr);
+                    }
+                }
+                // 处理结束
+            }
+            fci.close();
+            fis.close();
+            // 执行输出
+            if (aspect.compareTo(DESC) == 0){
+                List<String> returnList = new ArrayList<String>();
+                List<Long> returnPosList = new ArrayList<Long>();
+                for (int i = list.size() - 1; i >= 0 ; i--){
+                    String str = list.get(i);
+                    if (list.size() == posList.size()){
+                        Long pos = posList.get(i);
+                        returnPosList.add(pos);
+                    }
+                    returnList.add(str);
+                }
+                list = returnList;
+                posList = returnPosList;
+            }
+        } catch (Exception e) {
+            throw e;
+        } finally {
+            // 关闭资源
+        }
+    }
+
+    /**
+     * 循环处理成行
+     * @param sb
+     * @param list
+     * @param b
+     */
+    public void doFind(StringBuffer sb, List<String> list, char b) {
+        if (b == '\n') {
+            String tempStr = sb.toString();
+            boolean isSuc = findStr(sb, keyword, email);
+            if (isSuc){
+                list.add(tempStr);
+            }
+        } else {
+            if (aspect.compareTo(DESC) == 0){
+                sb.insert(0, b);
+            } else {
+                sb.append(b);
+            }
+        }
+    }
+
+    /**
+     * 查找指定字符串
+     * @param sb 历史记录
+     * @param keyword 查询关键字 可以为空
+     * @param email 对方邮箱，必须传入
+     */
+    public boolean findStr(StringBuffer sb, String keyword, String email) {
+
+    	if(sb.length() <= 24){
+    		return false;
+    	}
+        sb.delete(0, 24);
+        String str = sb.toString();
+        sb.delete(0, sb.length());
+        // 0：邮件 1：花店 2：内容
+        String[] strs = str.split(",,");
+        // 比较邮件内容
+        if (strs[0].equals(email) || email == null){
+            if (keyword == null || keyword.equals("")){
+                return true;
+            } else if (strs[2].contains(keyword)){
+                // 当前的位置就是最终的\n的位置
+                if (aspect.compareTo(DESC) == 0){
+                    posList.add(posEnd -  posSkip);
+                } else {
+                    posList.add(posStart + posSkip);
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public String getUrl() {
+        return url;
+    }
+
+    public void setUrl(String url) {
+        this.url = url;
+    }
+
+    public String getKeyword() {
+        return keyword;
+    }
+
+    public void setKeyword(String keyword) {
+        this.keyword = keyword;
+    }
+
+    public long getPosStart() {
+        return posStart;
+    }
+
+    public void setPosStart(long posStart) {
+        this.posStart = posStart;
+    }
+
+    public long getPosEnd() {
+        return posEnd;
+    }
+
+    public void setPosEnd(long posEnd) {
+        this.posEnd = posEnd;
+    }
+
+    public String getEmail() {
+        return email;
+    }
+
+    public void setEmail(String email) {
+        this.email = email;
+    }
+
+    public Short getAspect() {
+        return aspect;
+    }
+
+    public void setAspect(Short aspect) {
+        this.aspect = aspect;
+    }
+
+    public List<String> getList() {
+        return list;
+    }
+
+    public void setList(List<String> list) {
+        this.list = list;
+    }
+
+    public List<Long> getPosList() {
+        return posList;
+    }
+
+    public void setPosList(List<Long> posList) {
+        this.posList = posList;
+    }
+
+    public String getErrorMsg() {
+        return errorMsg;
+    }
+
+    public void setErrorMsg(String errorMsg) {
+        this.errorMsg = errorMsg;
+    }
+
+}
